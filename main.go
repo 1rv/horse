@@ -32,7 +32,6 @@ import (
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	"github.com/mattn/go-runewidth"
 	"golang.org/x/image/draw"
-	"golang.org/x/sys/unix"
 
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/lexers"
@@ -55,8 +54,7 @@ func main() {
 	}
 	width, height = screen.Size()
 
-	// kitty images go to /dev/tty since stdout gets eval'd by the shell
-	ttyFile, _ = os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+	ttyFile, _ = os.OpenFile(ttyPath, os.O_WRONLY, 0)
 	term := os.Getenv("TERM")
 	kittyOK = ttyFile != nil && (term == "xterm-kitty" ||
 		strings.Contains(term, "ghostty") ||
@@ -239,26 +237,7 @@ func openSelected() {
 	isExec := err == nil && stat.Mode()&0o111 != 0
 
 	go func(p string) {
-		var cmd *exec.Cmd
-		switch runtime.GOOS {
-		case "linux":
-			if isExec {
-				cmd = exec.Command(p)
-			} else {
-				cmd = exec.Command("xdg-open", p)
-			}
-		case "darwin":
-			if isExec {
-				cmd = exec.Command(p)
-			} else {
-				cmd = exec.Command("open", p)
-			}
-		default:
-			screen.Fini()
-			fmt.Println("dont actually know how to open a file on your OS, pls submit an issue")
-			os.Exit(0)
-		}
-		_ = cmd.Run()
+		_ = openCommand(p, isExec).Run()
 	}(fullPath)
 }
 
@@ -332,11 +311,11 @@ func handleMultiSelect() {
 	// what 2 run, so you see what youre working with
 	jumpTo(LastMarked)
 
-	token := braceList(names)
+	token := selList(names)
 
 	// prefill " %" and park cursor behind the space,
 	// so typing replaces selection placeholder
-	OpenPrompt("bash (%=sel): ", " % ", 0, func(cmd string) {
+	OpenPrompt(shellName+" (%=sel): ", " % ", 0, func(cmd string) {
 		if strings.TrimSpace(cmd) == "" {
 			return
 		}
@@ -346,7 +325,7 @@ func handleMultiSelect() {
 		} else {
 			final = final + " " + token
 		}
-		c := exec.Command("bash", "-c", final)
+		c := shellCommand(final)
 		c.Dir = Pwd
 		_ = c.Run()
 		Selecting = false
@@ -409,9 +388,9 @@ func selectOrToggle() {
 // jump to $HOME, or to / if we're already there
 func toggleHome() {
 	homeDir, err := os.UserHomeDir()
-	targetDir := homeDir
-	if err != nil || path.Clean(Pwd) == path.Clean(homeDir) {
-		targetDir = path.Clean("/")
+	targetDir := filepath.ToSlash(homeDir)
+	if err != nil || path.Clean(Pwd) == path.Clean(targetDir) {
+		targetDir = rootOf(Pwd)
 	}
 	SwitchDir(path.Clean(targetDir))
 }
@@ -424,7 +403,7 @@ func quitOnSelect() {
 	if selectedPath == "" {
 		os.Exit(0)
 	}
-	fmt.Printf("$EDITOR %s\n", escapePath(selectedPath))
+	fmt.Printf("%s %s\n", editorCmd, escapePath(selectedPath))
 	os.Exit(0)
 }
 
@@ -438,7 +417,7 @@ func quitOnPwd() {
 	} else {
 		items := CurrentList()
 		if len(items) > 0 && Selected < len(items) {
-			p = filepath.Join(Pwd, items[Selected])
+			p = path.Join(Pwd, items[Selected])
 		} else {
 			p = Pwd
 		}
@@ -743,14 +722,6 @@ func selectedNames() []string {
 	return out
 }
 
-// braceList makes {a,b,c} like the readme wants, or just the name for one
-func braceList(names []string) string {
-	if len(names) == 1 {
-		return names[0]
-	}
-	return "{" + strings.Join(names, ",") + "}"
-}
-
 /////////////////
 // fs & search //
 /////////////////
@@ -832,8 +803,9 @@ func SwitchDir(where string) error {
 		return fmt.Errorf("cannot switch to empty directory")
 	}
 
-	cleanPath := path.Clean(where)
-	if !path.IsAbs(cleanPath) {
+	cleanPath := path.Clean(filepath.ToSlash(where))
+	// the trailing slash matters: Clean turns a drive root into a bare "C:", which isn't absolute
+	if !filepath.IsAbs(cleanPath + "/") {
 		return fmt.Errorf("must provide an absolute path")
 	}
 
@@ -1073,20 +1045,6 @@ func fitCells(imgW, imgH, cols, rows int) (int, int) {
 	c = min(max(c, 1), cols)
 	r = min(max(r, 1), rows)
 	return c, r
-}
-
-// cellSize asks the terminal for its cell size in pixels, falling back to a ~1:2 guess
-func cellSize() (int, int) {
-	cw, ch := 10, 20
-	if ttyFile == nil {
-		return cw, ch
-	}
-	ws, err := unix.IoctlGetWinsize(int(ttyFile.Fd()), unix.TIOCGWINSZ)
-	if err == nil && ws.Xpixel > 0 && ws.Ypixel > 0 && ws.Col > 0 && ws.Row > 0 {
-		cw = int(ws.Xpixel) / int(ws.Col)
-		ch = int(ws.Ypixel) / int(ws.Row)
-	}
-	return cw, ch
 }
 
 // wraps a kitty graphics escape sequence for tmux's dcs passthrough
@@ -1454,10 +1412,13 @@ func togglePrevDir() {
 }
 
 func upDir() {
-	splitPwd := strings.Split(strings.TrimSuffix(Pwd, "/"), "/")
-	if len(splitPwd) > 1 {
-		newPwd := strings.Join(splitPwd[:len(splitPwd)-1], "/")
-		SwitchDir(fmt.Sprint("/", newPwd))
+	cur := path.Clean(Pwd)
+	parent := path.Dir(cur)
+	if !filepath.IsAbs(parent) {
+		parent = rootOf(cur) // path.Dir leaves a bare "C:" behind at a drive root
+	}
+	if path.Clean(parent) != cur {
+		SwitchDir(parent)
 	}
 }
 
@@ -1627,6 +1588,79 @@ func jumpTo(name string) {
 // helpers //
 /////////////
 
-func escapePath(p string) string {
-	return "'" + strings.ReplaceAll(p, "'", "'\\''") + "'"
+// the root a path sits under: "/" everywhere, "C:/" on windows
+func rootOf(p string) string {
+	return filepath.ToSlash(filepath.VolumeName(filepath.FromSlash(p))) + "/"
 }
+
+//////////////
+// platform //
+//////////////
+
+// pick picks the windows value on windows, the unix one everywhere else
+func pick(windows, unix string) string {
+	if isWindows {
+		return windows
+	}
+	return unix
+}
+
+var (
+	isWindows = runtime.GOOS == "windows"
+
+	// kitty images go here since stdout gets eval'd by the shell
+	ttyPath   = pick("CONOUT$", "/dev/tty")
+	shellName = pick("powershell", "bash")
+	editorCmd = pick("& $env:EDITOR", "$EDITOR")
+)
+
+// quote a path for the shell that eval's our output. powershell escapes a
+// single quote by doubling it, bash has to break out of the quotes
+func escapePath(p string) string {
+	if isWindows {
+		return "'" + strings.ReplaceAll(p, "'", "''") + "'"
+	}
+	return "'" + strings.ReplaceAll(p, "'", `'\''`) + "'"
+}
+
+// the selection as one token: a {a,b,c} brace expansion bash splits back into
+// many, or the comma separated array powershell takes
+func selList(names []string) string {
+	if isWindows {
+		quoted := make([]string, len(names))
+		for i, n := range names {
+			quoted[i] = escapePath(n)
+		}
+		return strings.Join(quoted, ",")
+	}
+	if len(names) == 1 {
+		return names[0]
+	}
+	return "{" + strings.Join(names, ",") + "}"
+}
+
+func shellCommand(line string) *exec.Cmd {
+	if isWindows {
+		return exec.Command(shellName, "-NoProfile", "-Command", line)
+	}
+	return exec.Command(shellName, "-c", line)
+}
+
+// run an executable directly, otherwise hand the file to the desktop opener
+func openCommand(p string, isExec bool) *exec.Cmd {
+	switch {
+	case isWindows:
+		// start hands the file to whatever windows registered for it
+		return exec.Command("cmd", "/c", "start", "", filepath.FromSlash(p))
+	case isExec:
+		return exec.Command(p)
+	case runtime.GOOS == "darwin":
+		return exec.Command("open", p)
+	}
+	return exec.Command("xdg-open", p)
+}
+
+// cellSize is the terminal's cell size in pixels. asking the terminal for the
+// real numbers needs the TIOCGWINSZ ioctl, which is unix only and would drag a
+// build-tagged file back in, so this is the ~1:2 guess everywhere
+func cellSize() (int, int) { return 10, 20 }

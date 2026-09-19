@@ -12,6 +12,15 @@ horse
 alias h='eval "$(horse)"'
 ```
 
+on windows, from powershell:
+
+```powershell
+go install github.com/if-not-nil/horse@latest
+horse
+# when you're comfortable,
+function h { Invoke-Expression (horse | Out-String) }
+```
+
 - use it like you would `cd ls cd ls`  
 - try opening folders and files with tab
 - try pressing backspace when in a folder  
@@ -46,7 +55,8 @@ C-y:
     the source; type a path (a/b/c) to copy elsewhere (Enter/Escape)
 C-x:
     selection mode: marks the current file. Tab marks/unmarks more,
-    C-x again runs a bash command on them (% = the files, e.g. `cp % ./`;
+    C-x again runs a shell command on them, bash or powershell on windows
+    (% = the files, e.g. `cp % ./`;
     if there's no %, they're appended). Escape cancels
 Left, C-h, C-b:
     go up a directory
